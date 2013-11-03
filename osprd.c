@@ -17,6 +17,8 @@
 #include "spinlock.h"
 #include "osprd.h"
 
+#include <stdbool.h>
+
 /* The size of an OSPRD sector. */
 #define SECTOR_SIZE	512
 
@@ -64,6 +66,10 @@ typedef struct osprd_info {
 
 	/* HINT: You may want to add additional fields to help
 	         in detecting deadlock. */
+	unsigned int num_write_locks;
+	unsigned int num_read_locks;
+	pid_t read_locks[OSPRD_MAJOR];
+	pid_t write_lock;
 
 	// The following elements are used internally; you don't need
 	// to understand them.
@@ -78,6 +84,37 @@ static osprd_info_t osprds[NOSPRD];
 
 
 // Declare useful helper functions
+bool deadlock (osprd_info_t *d)
+{
+	return false;
+}
+
+void add_read (osprd_info_t *d)
+{
+	d->num_read_locks++;
+	int i;
+	for (i = 0; i < OSPRD_MAJOR && d->read_locks[i] != -1; i++);
+	d->read_locks[i] = current->pid;
+}
+
+void del_read(osprd_info_t *d)
+{
+	d->num_read_locks--;
+	int i, j;
+  for (i = 0; i < OSPRD_MAJOR && d->read_locks[i] != -1; i++)
+  {
+  	// Shift read locks
+		if (d->read_locks[i] == current->pid)
+    {
+    	for( j = i + 1; j < OSPRD_MAJOR && d->read_locks[j] != -1; j++, i++)
+    	{
+    		d->read_locks[i] = d->read_locks[j];
+    	}
+    	d->read_locks[OSPRD_MAJOR-1] = -1;
+    	break;
+    }
+  }
+}
 
 /*
  * file2osprd(filp)
@@ -133,7 +170,7 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	else
 		end_request(req,0);
 
-	eprintk("Should process request...\n");
+	//eprintk("Should process request...\n");
 
 	end_request(req, 1);
 }
@@ -164,15 +201,26 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		// as appropriate.
 
 		// Your code here.
-
-		// This line avoids compiler warnings; you may remove it.
-		(void) filp_writable, (void) d;
-
-	}
+		if(filp->f_flags & F_OSPRD_LOCKED) {
+			eprintk("Closing ramdisk file that holds a lock...\n");
+      osp_spin_lock(&d->mutex);
+      filp->f_flags &= ~F_OSPRD_LOCKED;
+      if(filp_writable)
+      {
+          d->num_write_locks = 0;
+          d->write_lock = -1;
+      }
+      else
+      {
+          del_read(d);
+      }
+      osp_spin_unlock(&d->mutex);
+      wake_up_all(&d->blockq);
+    }
+  }
 
 	return 0;
 }
-
 
 /*
  * osprd_lock
@@ -191,9 +239,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 	// is file open for writing?
 	int filp_writable = (filp->f_mode & FMODE_WRITE) != 0;
 
-	// This line avoids compiler warnings; you may remove it.
-	(void) filp_writable, (void) d;
-
 	// Set 'r' to the ioctl's return value: 0 on success, negative on error
 
 	if (cmd == OSPRDIOCACQUIRE) {
@@ -204,7 +249,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// to write-lock the ramdisk; otherwise attempt to read-lock
 		// the ramdisk.
 		//
-                // This lock request must block using 'd->blockq' until:
+    // This lock request must block using 'd->blockq' until:
 		// 1) no other process holds a write lock;
 		// 2) either the request is for a read lock, or no other process
 		//    holds a read lock; and
@@ -234,9 +279,49 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// be protected by a spinlock; which ones?)
 
 		// Your code here (instead of the next two lines).
-		eprintk("Attempting to acquire\n");
-		r = -ENOTTY;
+		//eprintk("Attempting to acquire\n");
+		//r = -ENOTTY;
 
+     // Check deadlock
+   	if(deadlock(d))
+      r = -EDEADLK;
+    else
+    {
+			eprintk("Attempting to acquire lock...\n");
+			int local_ticket;
+	    osp_spin_lock(&d->mutex);
+	    local_ticket = d->ticket_head++;
+	    osp_spin_unlock(&d->mutex);
+
+	    // Try to get the locks!
+			// bool condition = (d->num_write_locks == 0)
+			// 	&& (!filp_writable || d->num_read_locks == 0)
+			// 	&& (d->ticket_tail == local_ticket);
+
+	    // TODO: Do something if wait_event_interruptible fails?
+	    // dunno why calling wait_event_interruptible before the if statement
+	    // with the condition doesn't work
+			if (filp_writable)
+      { // Write lock
+        wait_event_interruptible(d->blockq, d->num_write_locks == 0 
+        	&& d->num_read_locks == 0 && d->ticket_tail == local_ticket);
+        osp_spin_lock(&d->mutex);
+        d->num_write_locks++;
+        d->ticket_tail++;
+        d->write_lock = current->pid;
+        filp->f_flags |= F_OSPRD_LOCKED;
+        osp_spin_unlock(&d->mutex);                
+      }
+      else
+      { // Read lock
+        wait_event_interruptible(d->blockq, d->num_write_locks == 0 && d->ticket_tail == local_ticket);
+        osp_spin_lock(&d->mutex);
+        d->ticket_tail++;
+        filp->f_flags |= F_OSPRD_LOCKED;
+        add_read(d);
+        osp_spin_unlock(&d->mutex);                
+    	}
+    }
 	} else if (cmd == OSPRDIOCTRYACQUIRE) {
 
 		// EXERCISE: ATTEMPT to lock the ramdisk.
@@ -247,8 +332,32 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Otherwise, if we can grant the lock request, return 0.
 
 		// Your code here (instead of the next two lines).
-		eprintk("Attempting to try acquire\n");
-		r = -ENOTTY;
+		eprintk("Attempting to try acquire a lock...\n");
+
+		// TODO: & test deadlock?
+		if (d->num_write_locks != 0 
+			|| (filp_writable && d->num_read_locks != 0))
+		{
+			r = -EBUSY;
+		}
+		else
+		{
+			if (filp_writable)
+			{ // Write lock
+				osp_spin_lock(&d->mutex);
+				d->num_write_locks++;
+				d->write_lock = current->pid;
+				filp->f_flags |= F_OSPRD_LOCKED;
+				osp_spin_unlock(&d->mutex);
+			}
+			else
+			{ // Read lock
+				osp_spin_lock(&d->mutex);
+				add_read(d);
+				filp->f_flags |= F_OSPRD_LOCKED;
+				osp_spin_unlock(&d->mutex);
+			}
+		}
 
 	} else if (cmd == OSPRDIOCRELEASE) {
 
@@ -260,8 +369,27 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// you need, and return 0.
 
 		// Your code here (instead of the next line).
-		r = -ENOTTY;
-
+		eprintk("Attempting to release a lock...\n");
+		if ((filp->f_flags & F_OSPRD_LOCKED) == 0)
+		{
+      r = -EINVAL;
+		}
+    else
+    {
+    	osp_spin_lock(&d->mutex);
+      filp->f_flags &= ~F_OSPRD_LOCKED;
+      if (filp_writable)
+      {
+        d->num_write_locks= 0;
+        d->write_lock = -1;
+      }
+      else
+      {
+        del_read(d);
+      }
+      osp_spin_unlock(&d->mutex); 
+      wake_up_all(&d->blockq);    
+    }
 	} else
 		r = -ENOTTY; /* unknown command */
 	return r;
@@ -277,6 +405,14 @@ static void osprd_setup(osprd_info_t *d)
 	osp_spin_lock_init(&d->mutex);
 	d->ticket_head = d->ticket_tail = 0;
 	/* Add code here if you add fields to osprd_info_t. */
+	d->num_read_locks = 0;
+	d->num_write_locks = 0;
+	d->write_lock = -1;
+	int i;
+  for(i = 0; i < OSPRD_MAJOR; i++)
+  {
+    d->read_locks[i] = -1;
+  }
 }
 
 
