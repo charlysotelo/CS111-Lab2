@@ -34,7 +34,7 @@
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_DESCRIPTION("CS 111 RAM Disk");
 // EXERCISE: Pass your names into the kernel as the module's authors.
-MODULE_AUTHOR("Skeletor");
+MODULE_AUTHOR("Carlos Sotelo and Tania DePasquale");
 
 #define OSPRD_MAJOR	222
 
@@ -120,7 +120,19 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	// Consider the 'req->sector', 'req->current_nr_sectors', and
 	// 'req->buffer' members, and the rq_data_dir() function.
 
-	// Your code here.
+	//TODO: I'm assuming we have to lock here to guarantee atomicity.
+	// Also we want each process to block if the mutex is not available.
+	// and unlock once the process has been done.
+
+	int size = req->current_nr_sectors * SECTOR_SIZE;
+	int offset = req->sector * SECTOR_SIZE;
+	if( rq_data_dir(req) == READ)
+		memcpy(req->buffer,d->data + offset,size );
+	else if( rq_data_dir(req) == WRITE )
+		memcpy(d->data + offset, req->buffer, size);
+	else
+		end_request(req,0);
+
 	eprintk("Should process request...\n");
 
 	end_request(req, 1);
