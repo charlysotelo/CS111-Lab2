@@ -4,7 +4,9 @@ UID: 303891983
 Student: Tania DePasquale
 UID: 704018998
 
-Got this consistently passing 14+ test cases
+Got this consistently passing 12+ test cases
+
+I think I may have saw one of the first 8 fail one or two times.
 
 Biggest thing we need to figure out I think is a way to test dead lock (and fix those flaky test cases)
 
