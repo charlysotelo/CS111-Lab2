@@ -4,10 +4,10 @@ UID: 303891983
 Student: Tania DePasquale
 UID: 704018998
 
-Ok didn't see you say "don't do too much" till it was too late...
-anyways
 Got this consistently passing 14+ test cases
+
 Biggest thing we need to figure out I think is a way to test dead lock (and fix those flaky test cases)
+
 we can't have more than 1 write lock right? or am I wrong?
 
 
