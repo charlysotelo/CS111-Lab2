@@ -13,7 +13,7 @@
 #include <linux/blkdev.h>
 #include <linux/wait.h>
 #include <linux/file.h>
-
+#include <asm/uaccess.h>
 #include "spinlock.h"
 #include "osprd.h"
 
@@ -70,7 +70,8 @@ typedef struct osprd_info {
   unsigned int num_read_locks;
   pid_t read_locks[OSPRD_MAJOR];
   pid_t write_lock;
-
+  int deadlockwriting;
+  int deadlockreading;
   // The following elements are used internally; you don't need
   // to understand them.
   struct request_queue *queue;    // The device request queue.
@@ -82,12 +83,6 @@ typedef struct osprd_info {
 #define NOSPRD 4
 static osprd_info_t osprds[NOSPRD];
 
-
-// Declare useful helper functions
-bool deadlock (osprd_info_t *d)
-{
-  return false;
-}
 
 void add_read (osprd_info_t *d)
 {
@@ -135,6 +130,44 @@ static void for_each_open_file(struct task_struct *task,
              osprd_info_t *user_data);
 
 
+// Declare useful helper functions
+void check_locks(struct file * filp, osprd_info_t *d)
+{
+
+  //basically check to see if this process already has a request in the queue, or if 
+  //its already holding the wrong lock on the device (stacked read locks are allowed), then we detect deadlock.
+
+  //are we requesting a read lock or a write lock?
+  if(file2osprd(filp) == d) // we only care about the device we are requesting a lock to.
+  {
+        if(filp->f_flags & F_OSPRD_LOCKED) //we have a lock on this device, see if its allowed
+	{//WARNING: the line above only checks for current locks, not blocked requests.
+	 //lets focus on ongoing locks for the moment.
+		if(filp->f_mode & FMODE_WRITE )
+			d->deadlockreading = 1; // block either kind of lock
+		d->deadlockwriting = 1;         // block only write locks.
+	}
+  }
+}
+
+//if the device is already in use, and we are about to block to wait for it, make sure processes
+//owning the locks dont include us!
+bool deadlock (osprd_info_t *d, int filp_writable)
+{
+  //if filp_writable == true, we are requesting a write block
+  osp_spin_lock(&d->mutex);
+  d->deadlockwriting = 0;
+  d->deadlockreading = 0;
+  for_each_open_file(current,check_locks,d);// for each of this processes' open files,
+  if( d->deadlockreading || (d->deadlockwriting && filp_writable) )
+  {
+    osp_spin_unlock(&d->mutex);
+    return true;
+  }
+
+  osp_spin_unlock(&d->mutex);  
+  return false;
+}
 /*
  * osprd_process_request(d, req)
  *   Called when the user reads or writes a sector.
@@ -159,16 +192,33 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
   // Also we want each process to block if the mutex is not available.
   // and unlock once the process has been done.
 
+ // eprintk("Attemtping to satisfy request\n");
+ 
   int size = req->current_nr_sectors * SECTOR_SIZE;
-  int offset = req->sector * SECTOR_SIZE;
+  int offset = req->sector * SECTOR_SIZE; 
+
+  if(nsectors < req->current_nr_sectors || nsectors < req->sector + req->current_nr_sectors)
+    end_request(req,0);
+
+  osp_spin_lock(&d->mutex);
   if( rq_data_dir(req) == READ)
+  {
     memcpy(req->buffer,d->data + offset,size );
+    //copy_to_user(req->buffer,d->data + offset, size);
+  //  for( i = 0; i < size ; i ++)
+  //  if(*req->buffer != 0)
+   //   eprintk("read %c\n",*req->buffer);
+  }
   else if( rq_data_dir(req) == WRITE )
+  {
     memcpy(d->data + offset, req->buffer, size);
+    //  eprintk("writing %c \n",*req->buffer);
+  }
   else
     end_request(req,0);
 
-  //eprintk("Should process request...\n");
+  osp_spin_unlock(&d->mutex);  
+//eprintk("Should process request...\n");
 
   end_request(req, 1);
 }
@@ -198,20 +248,24 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
     // a lock, release the lock.  Also wake up blocked processes
     // as appropriate.
 
+      
+    eprintk("closing. dIsk has %i write lock and %i read locks\n",d->num_write_locks,d->num_read_locks);
     // Your code here.
     if(filp->f_flags & F_OSPRD_LOCKED) {
-      eprintk("Closing ramdisk file that holds a lock...\n");
       osp_spin_lock(&d->mutex);
       filp->f_flags &= ~F_OSPRD_LOCKED;
       if(filp_writable)
       {
+	  eprintk("freeing write lock \n");
           d->num_write_locks = 0;
           d->write_lock = -1;
       }
       else
       {
-          del_read(d);
+        eprintk("freeing read lock\n");
+	del_read(d);
       }
+      
       osp_spin_unlock(&d->mutex);
       wake_up_all(&d->blockq);
     }
@@ -236,7 +290,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
   // is file open for writing?
   int filp_writable = (filp->f_mode & FMODE_WRITE) != 0;
-
+  if(d == NULL)
+    return -1;
   // Set 'r' to the ioctl's return value: 0 on success, negative on error
 
   if (cmd == OSPRDIOCACQUIRE) {
@@ -281,11 +336,14 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     //r = -ENOTTY;
 
      // Check deadlock
-    if(deadlock(d))
+    if(deadlock(d,filp_writable))
+    {
+      eprintk("Avoiding deadlock\n");
       r = -EDEADLK;
+    }
     else
     {
-      eprintk("Attempting to acquire lock...\n");
+      //eprintk("Attempting to acquire lock...\n");
       int local_ticket;
       osp_spin_lock(&d->mutex);
       local_ticket = d->ticket_head++;
@@ -301,23 +359,60 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       // with the condition doesn't work
       if (filp_writable)
       { // Write lock
-        wait_event_interruptible(d->blockq, d->num_write_locks == 0 
-          && d->num_read_locks == 0 && d->ticket_tail == local_ticket);
-        osp_spin_lock(&d->mutex);
-        d->num_write_locks++;
-        d->ticket_tail++;
+        do
+	{
+	  int status = wait_event_interruptible(d->blockq, d->num_write_locks == 0 
+            && d->num_read_locks == 0 && d->ticket_tail >= local_ticket);
+
+          if(status != 0 )
+	  {
+	    d->ticket_tail++;
+	    return status;
+	  }
+	  eprintk("write queue released\n");
+	}while(!(d->num_write_locks == 0 && d->num_read_locks == 0 && local_ticket <= d->ticket_tail));
+	
+        // Check deadlock
+        if(deadlock(d,filp_writable))
+        {
+          eprintk("Avoiding deadlock\n");
+          d->ticket_tail++;
+          return -EDEADLK;
+        }eprintk("serving ticket %i for write\n",local_ticket);
+	//this does not have to be locked, since the ticket number is unique per process.
+	d->deadlockwriting = 0;
+	d->num_write_locks = 1;
+        d->ticket_tail++; 
         d->write_lock = current->pid;
         filp->f_flags |= F_OSPRD_LOCKED;
-        osp_spin_unlock(&d->mutex);                
       }
       else
       { // Read lock
-        wait_event_interruptible(d->blockq, d->num_write_locks == 0 && d->ticket_tail == local_ticket);
-        osp_spin_lock(&d->mutex);
-        d->ticket_tail++;
+	do
+	{
+      	  int status = wait_event_interruptible(d->blockq, d->num_write_locks == 0 
+							&& d->ticket_tail >= local_ticket);
+	  if(status != 0 )
+	  {
+	    d->ticket_tail++;
+	    return status;
+	  }
+	  eprintk("Read queue released\n");
+
+	}while(!(d->num_write_locks == 0 && local_ticket <= d->ticket_tail));
+	
+	// Check deadlock
+        if(deadlock(d,filp_writable))
+        {
+          eprintk("Avoiding deadlock\n");
+          d->ticket_tail++;
+          return -EDEADLK;
+        }
+        eprintk("serving ticket %i for read\n",local_ticket);
+        d->deadlockreading = 0;
+	d->ticket_tail++;
         filp->f_flags |= F_OSPRD_LOCKED;
         add_read(d);
-        osp_spin_unlock(&d->mutex);                
       }
     }
   } else if (cmd == OSPRDIOCTRYACQUIRE) {
@@ -325,12 +420,20 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     // EXERCISE: ATTEMPT to lock the ramdisk.
     //
     // This is just like OSPRDIOCACQUIRE, except it should never
-    // block.  If OSPRDIOCACQUIRE would block or return deadlock,
+    // block.e
+   //   {
+        //int i;
+        //for(i = 0; i < OSPRD_MAJOR; i++)
+        // d->read_locks[i] = -1;
+       // del_read(d);
+     // }
+    //  osp_spin_unlock(&d->mutex);
+ //If OSPRDIOCACQUIRE would block or return deadlock,
     // OSPRDIOCTRYACQUIRE should return -EBUSY.
     // Otherwise, if we can grant the lock request, return 0.
 
     // Your code here (instead of the next two lines).
-    eprintk("Attempting to try acquire a lock...\n");
+    //eprintk("Attempting to try acquire a lock...\n");
 
     // TODO: & test deadlock?
     if (d->num_write_locks != 0 
@@ -343,7 +446,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       if (filp_writable)
       { // Write lock
         osp_spin_lock(&d->mutex);
-        d->num_write_locks++;
+        d->num_write_locks = 1;
         d->write_lock = current->pid;
         filp->f_flags |= F_OSPRD_LOCKED;
         osp_spin_unlock(&d->mutex);
@@ -367,7 +470,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     // you need, and return 0.
 
     // Your code here (instead of the next line).
-    eprintk("Attempting to release a lock...\n");
+    eprintk("Attempting to release a lock.. flag is %i.\n",filp->f_flags & F_OSPRD_LOCKED);
     if ((filp->f_flags & F_OSPRD_LOCKED) == 0)
     {
       r = -EINVAL;
@@ -385,6 +488,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       {
         del_read(d);
       }
+      //d->ticket_tail++;
       osp_spin_unlock(&d->mutex); 
       wake_up_all(&d->blockq);    
     }
@@ -406,6 +510,8 @@ static void osprd_setup(osprd_info_t *d)
   d->num_read_locks = 0;
   d->num_write_locks = 0;
   d->write_lock = -1;
+  d->deadlockwriting = 0;
+  d->deadlockreading = 0;
   int i;
   for(i = 0; i < OSPRD_MAJOR; i++)
   {
